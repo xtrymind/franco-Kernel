@@ -27,6 +27,8 @@
 #include <linux/input.h>
 #include <linux/jiffies.h>
 
+#include <linux/earlysuspend.h>
+
 #define MAKO_HOTPLUG "mako_hotplug"
 
 #define DEFAULT_FIRST_LEVEL 60
@@ -54,6 +56,8 @@ static DEFINE_PER_CPU(struct cpu_load_data, cpuload);
 
 static struct workqueue_struct *wq;
 static struct delayed_work decide_hotplug;
+static struct work_struct suspend;
+static struct work_struct resume;
 
 static inline int get_cpu_load(unsigned int cpu)
 {
@@ -109,6 +113,9 @@ static void __ref decide_hotplug_func(struct work_struct *work)
 	unsigned int freq_buf;
 	struct cpufreq_policy policy;
 
+	if (unlikely(num_online_cpus() == 1))
+		goto reschedule;
+
     for_each_online_cpu(cpu) 
     {
 		cur_load = get_cpu_load(cpu);
@@ -154,38 +161,57 @@ static void __ref decide_hotplug_func(struct work_struct *work)
 			break;
 	}
 
+reschedule:
     queue_delayed_work_on(0, wq, &decide_hotplug, msecs_to_jiffies(TIMER));
 }
 
-static int mako_hotplug_suspend(struct platform_device *pdev, pm_message_t state)
+static void mako_hotplug_suspend(struct work_struct *work)
 {
 	int cpu;
 
 	pr_info("%s: suspend\n", MAKO_HOTPLUG);
 
-	if (delayed_work_pending(&decide_hotplug))
+	stats.counter[0] = 0;
+	stats.counter[1] = 0;
+
+	for_each_online_cpu(cpu)
 	{
-		cancel_delayed_work_sync(&decide_hotplug);
+		if (!cpu)
+			continue;
 
-		stats.counter[0] = 0;
-		stats.counter[1] = 0;
-
-		for_each_possible_cpu(cpu)
-		{
-			if (cpu_online(cpu) && cpu)
-				cpu_down(cpu);
-		}
+		cpu_down(cpu);
 	}
-
-	return 0;
 }
 
-static int mako_hotplug_resume(struct platform_device *pdev)
+static void __ref mako_hotplug_resume(struct work_struct *work)
 {
-	queue_delayed_work_on(0, wq, &decide_hotplug, 0);
+	int cpu;
 
-	return 0;
+	for_each_possible_cpu(cpu)
+	{
+		if (!cpu)
+			continue;
+
+		cpu_up(cpu);
+	}
 }
+
+static void mako_hotplug_early_suspend(struct early_suspend *handler)
+{   
+	schedule_work(&suspend);
+}
+
+static void mako_hotplug_late_resume(struct early_suspend *handler)
+{   
+	schedule_work(&resume);
+}
+
+static struct early_suspend early_suspend =
+{
+	.level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN + 1,
+	.suspend = mako_hotplug_early_suspend,
+	.resume = mako_hotplug_late_resume,
+};
 
 /* sysfs functions for external driver */
 void update_first_level(unsigned int level)
@@ -212,8 +238,12 @@ static int __devinit mako_hotplug_probe(struct platform_device *pdev)
 	}
 
 	stats.timestamp[0] = jiffies;
-	stats.timestamp[1] = jiffies;    
+	stats.timestamp[1] = jiffies;
 
+	register_early_suspend(&early_suspend);
+
+	INIT_WORK(&suspend, mako_hotplug_suspend);
+	INIT_WORK(&resume, mako_hotplug_resume);
     INIT_DELAYED_WORK(&decide_hotplug, decide_hotplug_func);
 
 	queue_delayed_work_on(0, wq, &decide_hotplug, HZ * 20);
@@ -239,8 +269,6 @@ static int mako_hotplug_remove(struct platform_device *pdev)
 static struct platform_driver mako_hotplug_driver = {
 	.probe = mako_hotplug_probe,
 	.remove = mako_hotplug_remove,
-	.suspend = mako_hotplug_suspend,
-	.resume = mako_hotplug_resume,
 	.driver = {
 		.name = MAKO_HOTPLUG,
 		.owner = THIS_MODULE,
